@@ -1,100 +1,142 @@
--- Part 1
-select product_name as "Tên SP", price as "Đơn giá", price*1.1 as "Giá VAT" from products;
+-- Tạo index
+CREATE INDEX idx_taikhoan_khachhang ON taikhoan(khach_hang_id);
 
-select city, count(customer_id) from customers
-group by city
-order by count(customer_id) desc;
+--part1.1--
+create or replace procedure chuyen_tien(
+    p_tk_gui int,
+    p_tk_nhan int,
+    p_sotien numeric(15,2),
+    p_noi_dung text
+) language plpgsql
+as $$
+    declare
+        status_gui varchar(20);
+        status_nhan varchar(20);
+        du_gui numeric(15,2);
+        du_nhan numeric(15,2);
+        id_khach_nhan int;
+        id_khach_gui int;
+    begin
+        --Nhập trạng thái tài khoản gửi vào declare
+        select trang_thai into status_gui from taikhoan
+        where id=p_tk_gui;
 
-select max(price), min(price), avg(price) from products;
+        -- Nhập trạng thái tài khoản nhận vào declare
+        select trang_thai into status_nhan from taikhoan
+        where id=p_tk_nhan;
 
-select count(*) filter (where status='Completed') as Completed,
-    count(*) filter (where status='Pending') as Pending,
-    count(*) filter (where status='Cancelled') as Cancelled,
-    count(*) filter (where status='Processing') as Processing from orders;
+        -- Nhập số dư người gửi vào declare
+        select so_du into du_gui from taikhoan
+        where id=p_tk_gui;
 
---Part 2
-select o.order_id,c.customer_id,c.customer_name,total_amount from orders o
-inner join customers c on o.customer_id = c.customer_id
-order by order_date desc
-limit 10;
+        -- Nhập số dư người nhận vào declare
+        select so_du into du_nhan from taikhoan
+        where id=p_tk_nhan;
 
-select category_name,count(product_id) from categories
-left join products on categories.category_id = products.category_id
-group by category_name;
+        -- Nhập id khách hàng gửi vào declare
+        select khach_hang_id into id_khach_gui from taikhoan
+        where id=p_tk_gui;
 
-select orders.customer_id,customer_name, count(orders.customer_id) from orders
-inner join customers on orders.customer_id = customers.customer_id
-where total_amount>5000000
-group by orders.customer_id, customer_name
-having count(orders.customer_id)>2;
+        -- Nhập id khách hàng nhận vào declare
+        select khach_hang_id into id_khach_nhan from taikhoan
+        where id=p_tk_nhan;
 
-select orders.customer_id, customers.customer_name from orders
-inner join customers on orders.customer_id = customers.customer_id
-where total_amount = ( select max(total_amount) from orders);
+        -- Roll back ngay khi không tồn tại tài khoản or tkhoan ko active
+        if status_gui != 'Active' or status_nhan!='Active' then
+            raise exception 'Chuyển tiền không thành công';
+        end if;
 
---Part3
-select *from products
-where price > (select avg(price) from products);
+        -- Ko đủ tiền
+        if du_gui < p_sotien then
+            raise exception 'Tài khoản không đủ tiền';
+        end if;
 
-select *from customers
-where not exists(
-    select 1
-    from orders
-    where orders.customer_id=customers.customer_id
-);
+        -- Update số dư
+        update taikhoan
+        set so_du=so_du-p_sotien where id=p_tk_gui;
 
-select p1.product_name, categories.category_name from products p1
-inner join categories on p1.category_id = categories.category_id
-where p1.price >(
-    select avg(p2.price) from products p2
-    where p1.category_id=p2.category_id
-);
+        update taikhoan
+        set so_du=so_du+p_sotien where id=p_tk_nhan;
 
-select *from customers
-inner join orders on customers.customer_id = orders.customer_id
-where total_amount = (select max(orders.total_amount) from orders);
+        --Update tổng số dư
+        update khachhang
+        set so_du_tong = so_du_tong-p_sotien where id=id_khach_gui;
 
---Part4
-select email from customers
-union
-select email from suppliers;
+        update khachhang
+        set so_du_tong = so_du_tong+p_sotien where id=id_khach_nhan;
 
-select orders.customer_id from orders
-inner join order_items on orders.order_id = order_items.order_id
-inner join products on order_items.product_id = products.product_id
-inner join categories on products.category_id = categories.category_id
-where category_name='Electronics'
-group by orders.customer_id
-intersect
-select orders.customer_id from orders
-inner join order_items on orders.order_id = order_items.order_id
-inner join products on order_items.product_id = products.product_id
-inner join categories on products.category_id = categories.category_id
-where category_name='Books'
-group by orders.customer_id;
+        -- Lưu lịch sử số dư
+        insert into lichsusodu(tai_khoan_id, so_du_truoc, so_du_sau, thoi_gian) values
+        (p_tk_gui,du_gui,du_gui-p_sotien,current_timestamp);
 
---Part5
-update orders
-set total_amount =(
-    select sum(quantity*unit_price) from order_items
-    where order_items.order_id=orders.order_id
-    group by order_items.order_id
-);
+        insert into lichsusodu(tai_khoan_id, so_du_truoc, so_du_sau, thoi_gian) values
+            (p_tk_nhan,du_nhan,du_nhan+p_sotien,current_timestamp);
 
-select city from customers
-inner join orders on customers.customer_id = orders.customer_id
-where extract(year from order_date)=2026
-group by city
-having sum(orders.total_amount) = (
-    select sum(orders.total_amount) from customers
-    inner join orders on customers.customer_id = orders.customer_id
-    where extract(year from order_date)=2026
-    group by city
-    order by sum(orders.total_amount)
-    limit 1
-);
+        --Lưu vào bảng giao dịch
+        insert into giaodich(ma_gd, tai_khoan_id, loai_gd, so_tien, tai_khoan_doi_tac, noi_dung,trang_thai) values
+            ('xxxx',p_tk_gui,'CHUYEN_TIEN',p_sotien,p_tk_nhan,p_noi_dung,'SUCCESS');
+    end;
+$$;
 
+--part1.2--
+create or replace procedure rut_tien(
+    p_tk int,
+    p_tien int
+) language plpgsql
+as $$
+    declare
+        p_sodu numeric(15,2);
+        p_status varchar(20);
+    begin
+        select so_du into p_sodu from taikhoan
+        where id=p_tk;
 
+        select p_status into p_status from taikhoan
+        where id=p_tk;
 
+        if p_status!='Active' or p_sodu < p_tien then
+            raise exception 'Tài khoản không đủ tiền/Không tồn tại tài khoản';
+        end if;
+
+        insert into lichsusodu(tai_khoan_id, so_du_truoc, so_du_sau, thoi_gian) values
+        (p_tk,p_sodu,p_sodu-p_tien,current_timestamp);
+
+        insert into giaodich(ma_gd, tai_khoan_id, loai_gd, so_tien, tai_khoan_doi_tac, noi_dung,trang_thai) values
+            ('xxxx',p_tk,'RUT_TIEN',p_tien,null,null,'SUCCESS');
+    end;
+$$;
+
+call rut_tien(1,500000);
+
+--part 2--
+create or replace procedure thong_tin_tai_khoan(
+    p_tk int,
+    out name varchar(100),
+    out sodu numeric(15,2),
+    out tong_success int
+) language plpgsql
+as $$
+    declare
+        p_kh int;
+    begin
+        select khach_hang_id into p_kh from taikhoan
+        where p_tk=id;
+
+        if p_kh is null  then
+            raise exception 'Lỗi';
+        end if;
+
+        select ho_ten into name from khachhang
+        where id=p_kh;
+
+        select so_du into sodu from taikhoan
+        where p_tk=id;
+
+        select count(*) filter (where trang_thai='SUCCESS') into tong_success from giaodich
+        where tai_khoan_id=p_tk;
+    end;
+$$;
+
+call thong_tin_tai_khoan(2,null,null,null);
 
 
